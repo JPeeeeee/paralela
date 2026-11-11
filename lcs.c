@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef max
 #define max( a, b ) ( ((a) > (b)) ? (a) : (b) )
@@ -131,6 +132,10 @@ void freeScoreMatrix(mtype **scoreMatrix, int sizeB) {
 }
 
 int main(int argc, char ** argv) {
+#ifdef BENCHMARK
+	struct timespec ts0, ts1, tc0, tc1;
+	clock_gettime(CLOCK_MONOTONIC, &ts0);
+#endif
 	// sequence pointers for both sequences
 	char *seqA, *seqB;
 
@@ -151,8 +156,17 @@ int main(int argc, char ** argv) {
 	//initialize LCS score matrix
 	initScoreMatrix(scoreMatrix, sizeA, sizeB);
 
+#ifdef BENCHMARK
+	clock_gettime(CLOCK_MONOTONIC, &ts1);
+	clock_gettime(CLOCK_MONOTONIC, &tc0);
+#endif
+
 	//fill up the rest of the matrix and return final score (element locate at the last line and collumn)
 	mtype score = LCS(scoreMatrix, sizeA, sizeB, seqA, seqB);
+
+#ifdef BENCHMARK
+	clock_gettime(CLOCK_MONOTONIC, &tc1);
+#endif
 
 	/* if you wish to see the entire score matrix,
 	 for debug purposes, define DEBUGMATRIX. */
@@ -162,6 +176,15 @@ int main(int argc, char ** argv) {
 
 	//print score
 	printf("\nScore: %d\n", score);
+
+#ifdef BENCHMARK
+	double t_seq = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+	double t_comp = (tc1.tv_sec - tc0.tv_sec) + (tc1.tv_nsec - tc0.tv_nsec) * 1e-9;
+	double t_total = t_seq + t_comp;
+	printf("TIME_TOTAL: %lf\n", t_total);
+	printf("TIME_SEQ: %lf\n", t_seq);
+	printf("TIME_COMP: %lf\n", t_comp);
+#endif
 
 	//free score matrix
 	freeScoreMatrix(scoreMatrix, sizeB);
