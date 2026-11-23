@@ -16,7 +16,7 @@
 #define MPI_MTYPE_BYTES sizeof(mtype)
 
 #ifndef DEFAULT_K
-#define DEFAULT_K 100
+#define DEFAULT_K 400
 #endif
 
 typedef unsigned short mtype;
