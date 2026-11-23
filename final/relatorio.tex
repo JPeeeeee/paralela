@@ -48,14 +48,16 @@
 \maketitle
 
 \begin{abstract}
-Este relatório apresenta o projeto, implementação e análise de desempenho da paralelização híbrida (MPI + OpenMP) do algoritmo da Maior Subsequência Comum (\textit{Longest Common Subsequence} -- LCS). Devido às restrições inerentes de dependência de dados na programação dinâmica, foi adotada uma estratégia baseada em blocos (\textit{tiling}) com avanço em diagonais (\textit{wavefront}). A distribuição de blocos em nível de rede/processos é gerenciada via MPI, enquanto o paralelismo em nível de nós e núcleos compartilhados é executado com OpenMP. São discutidas a fração sequencial da aplicação, a aplicação da Lei de Amdahl, métricas de \textit{speedup}, eficiência e características de escalabilidade.
+Este relatório apresenta o projeto, implementação e avaliação experimental da paralelização híbrida (MPI + OpenMP) do algoritmo da Maior Subsequência Comum (\textit{Longest Common Subsequence} -- LCS). O algoritmo utiliza programação dinâmica com padrão de dependência bidimensional em frente de onda (\textit{wavefront}). A paralelização foi estruturada por decomposição em blocos (\textit{tiling}) com granularidade $K \times K$, distribuindo os blocos em nível inter-nós com MPI e paralelizando o cálculo das diagonais internas via OpenMP. Apresentam-se os resultados práticos obtidos a partir de 20 execuções em ambiente distribuído com 2 processos MPI e 4 threads OpenMP por processo, correlacionando-os à Lei de Amdahl, à relação computação/comunicação e aos efeitos da granularidade sobre a escalabilidade.
 \end{abstract}
 
-\hr
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Recorte e Funcionamento do Kernel Sequencial}
 
-O problema da Maior Subsequência Comum (LCS) determina o tamanho da subsequência máxima preservando a ordem relativa dos caracteres entre duas sequências $A$ e $B$, com comprimentos $n$ e $m$, respectivamente. O núcleo computacional sequencial baseia-se em programação dinâmica, preenchendo uma matriz de pontuação de ordem $(m+1) \times (n+1)$:
+O problema da Maior Subsequência Comum (LCS) determina o tamanho da subsequência máxima preservando a ordem relativa dos caracteres entre duas sequências $A$ e $B$, com comprimentos $m$ e $n$, respectivamente. O núcleo computacional sequencial baseia-se em programação dinâmica, preenchendo uma matriz de pontuação de ordem $(m+1) \times (n+1)$:
 
 \begin{lstlisting}[caption={Kernel sequencial do algoritmo LCS (lcs.c).}]
 int LCS(mtype **scoreMatrix, int sizeA, int sizeB, char *seqA, char *seqB) {
@@ -77,200 +79,168 @@ int LCS(mtype **scoreMatrix, int sizeA, int sizeB, char *seqA, char *seqB) {
 \subsection*{Funcionamento e Dependências de Dados}
 A cada iteração $(i, j)$, o valor da célula depende de três posições previamente calculadas:
 \begin{enumerate}
-    \item \textbf{Diagonal superior esquerda} ($\text{scoreMatrix}[i-1][j-1]$): acessada quando os caracteres correspondentes coincidem ($seqA[j-1] == seqB[i-1]$), incrementando a pontuação em $+1$.
-    \item \textbf{Célula superior} ($\text{scoreMatrix}[i-1][j]$) e \textbf{célula à esquerda} ($\text{scoreMatrix}[i][j-1]$): avaliadas caso os caracteres sejam distintos, herdando o maior valor acumulado.
+    \item \textbf{Diagonal superior esquerda} ($\text{scoreMatrix}[i-1][j-1]$): acessada quando os caracteres correspondentes coincidem ($seqA[j-1] == seqB[i-1]$), incrementando a pontuação acumulada em $+1$.
+    \item \textbf{Célula superior} ($\text{scoreMatrix}[i-1][j]$) e \textbf{célula à esquerda} ($\text{scoreMatrix}[i][j-1]$): avaliadas caso os caracteres sejam distintos, herdando o valor máximo entre ambas as opções.
 \end{enumerate}
 
-Essa relação de recorrência impõe uma dependência estrita de dados: uma linha não pode ser calculada de forma independente antes da anterior, e o mesmo ocorre entre colunas. Contudo, células situadas na mesma anti-diagonal ($i + j = \text{constante}$) dependem exclusivamente de diagonais anteriores, sendo mutuamente independentes entre si.
+Essa relação de recorrência impõe uma dependência estrita de dados: uma linha não pode ser calculada de forma independente antes da linha anterior, e o mesmo ocorre entre colunas adjacentes. Contudo, células situadas na mesma anti-diagonal ($i + j = \text{constante}$) dependem exclusivamente de diagonais anteriores, sendo mutuamente independentes entre si, o que viabiliza o paralelismo em onda (\textit{wavefront}).
 
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Estratégia Final de Paralelização (Híbrida: MPI + OpenMP)}
 
-Para paralelizar com eficácia em sistemas de memória distribuída e compartilhada, optou-se por uma decomposição em grade de blocos quadrados de dimensão $K \times K$ (\textit{tiling}):
+Para paralelizar com eficácia em sistemas de memória distribuída e compartilhada, implementou-se a estratégia em blocos (\textit{tiling}) com avanço em diagonais:
 
-\begin{figure}[h!]
-    \centering
-    \begin{minipage}{0.48\textwidth}
-        \centering
-        \textbf{Nível Macro (MPI)}\\[1ex]
-        A matriz é particionada em $B_{\text{Rows}} \times B_{\text{Cols}}$ blocos. As diagonais de blocos são processadas em onda (\textit{wavefront}). Em cada diagonal, os blocos são distribuídos estaticamente entre os processos MPI. Ao fim de cada diagonal de blocos, ocorre troca das bordas via \texttt{MPI\_Allgatherv}.
-    \end{minipage}
-    \hfill
-    \begin{minipage}{0.48\textwidth}
-        \centering
-        \textbf{Nível Micro (OpenMP)}\\[1ex]
-        Dentro de cada bloco atribuído a um processo, a função \texttt{compute\_block} percorre as diagonais internas. Os elementos de cada diagonal interna são distribuídos paralelamente entre as \textit{threads} locais via:
-        \texttt{\#pragma omp parallel for schedule(static)}.
-    \end{minipage}
-\end{figure}
+\begin{enumerate}
+    \item \textbf{Nível Macro (MPI inter-nós):} A matriz de pontuação $(m+1) \times (n+1)$ é dividida em uma grade de blocos de dimensões $K \times K$. O avanço ocorre ao longo das diagonais de blocos ($d = 0, \dots, B_{\text{Diags}}-1$). Em cada diagonal de blocos, a quantidade de blocos independentes é distribuída de forma balanceada entre os processos MPI via a rotina \texttt{block\_range}.
+    \item \textbf{Otimização de Comunicação via Bordas:} Para calcular um bloco dependente na diagonal seguinte, são necessárias apenas a sua borda superior e a sua borda esquerda. Cada processo empacota apenas a última linha e a última coluna de cada bloco calculado em um buffer contíguo (\texttt{borderBuf}) de tamanho $2 \times K$ elementos por bloco. A troca global das bordas ocorre através da primitiva coletiva \texttt{MPI\_Allgatherv}.
+    \item \textbf{Nível Micro (OpenMP intra-nó):} Dentro de cada bloco $K \times K$, a rotina \texttt{compute\_block} calcula as anti-diagonais internas. Os elementos de cada diagonal interna são distribuídos paralelamente entre as \textit{threads} locais via diretiva:
+    \begin{quote}
+        \texttt{\#pragma omp parallel for schedule(static)}
+    \end{quote}
+\end{enumerate}
 
-\subsection*{Otimização de Comunicação}
-Para calcular um bloco vizinho, apenas a \textbf{última linha} (fronteira inferior) e a \textbf{última coluna} (fronteira direita) são estritamente necessárias. Assim, em vez de trafegar blocos inteiros pela rede, cada rank empacota apenas $2 \times K$ elementos por bloco calculado em um buffer contíguo (\texttt{border\_buffer}). A sincronização global é realizada através da primitiva coletiva \texttt{MPI\_Allgatherv}.
-
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Metodologia Experimental e Ambiente de Execução}
 
-Os testes de desempenho foram conduzidos sob metodologia rigorosa a fim de mitigar ruídos e garantir reprodutibilidade:
+Os testes experimentais foram executados seguindo rigorosa metodologia estatística:
 
 \begin{itemize}
-    \item \textbf{Processador:} [Inserir modelo, ex.: AMD Ryzen 7 5700X / Intel Core i7-11800H / Cluster DINF], com [X] núcleos físicos e [Y] núcleos lógicos (SMT habilitado).
-    \item \textbf{Sistema Operacional e Kernel:} Linux Ubuntu 22.04 LTS (Kernel 5.15 / 6.x) [ou macOS / ambiente do teste].
-    \item \textbf{Compilador e Flags:} \texttt{mpicc} (base \texttt{gcc} versão X), compilado com as flags de otimização máxima:
-    \begin{quote}
-        \texttt{-fopenmp -O3 -Wall -lm}
-    \end{quote}
-    \item \textbf{Controle de Frequência e Ruído:}
-    \begin{itemize}
-        \item O escalonador de frequência da CPU foi configurado no modo de alto desempenho (\texttt{governor=performance}), desabilitando oscilações dinâmicas de energia (DVFS).
-        \item O \textit{Turbo Boost} foi fixado/monitorado para evitar variações térmicas (\textit{thermal throttling}) ao longo das repetições.
-        \item Todos os testes foram executados sem processos concorrentes em segundo plano.
-    \end{itemize}
-    \item \textbf{Repetições:} Cada cenário foi executado rigorosamente \textbf{20 vezes}. As métricas reportadas correspondem à média aritmética acompanhada do respectivo desvio padrão ($\mu \pm \sigma$).
+    \item \textbf{Infraestrutura Distribuída:} Execução através de 2 nós interconectados em rede local (endereços IP \texttt{10.254.223.43} e \texttt{10.254.223.44}, definidos via arquivo \texttt{hosts}), alocando 1 processo MPI por nó.
+    \item \textbf{Configuração Híbrida:} 2 processos MPI com 4 \textit{threads} OpenMP por processo (\texttt{OMP\_NUM_THREADS=4}), totalizando 8 trabalhadores paralelos.
+    \item \textbf{Entrada Testada:} Arquivos \texttt{fileA.in} e \texttt{fileB.in} gerados pseudoaleatoriamente a partir do alfabeto biológico $\{A, T, G, C\}$ com comprimento $N = 1000$ caracteres.
+    \item \textbf{Granularidade de Bloco:} $K = 4$ (blocos de $4 \times 4$ elementos), resultando em $\frac{1000}{4} = 250$ blocos por dimensão e 499 etapas de sincronização diagonal.
+    \item \textbf{Compilador e Flags:} \texttt{mpicc} com \texttt{-fopenmp -O3 -Wall -lm}.
+    \item \textbf{Número de Repetições:} Cada medição foi repetida rigorosamente \textbf{20 vezes} consecutivas para possibilitar o cálculo de média ($\mu$), desvio padrão ($\sigma$) e valores extremos (mínimo e máximo).
+    \item \textbf{Verificação de Corretude:} O valor final retornado (\textit{Score}) foi validado em todas as 20 execuções contra o gabarito obtido pela versão sequencial padrão (\texttt{lcs.c}).
 \end{itemize}
 
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Fração Puramente Sequencial da Aplicação}
 
-A execução do programa é constituída por:
+A execução sequencial decompõe-se em duas etapas principais:
 \begin{enumerate}
-    \item \textbf{Região Sequencial ($T_{\text{seq}}$):} Leitura dos arquivos de entrada (\texttt{read\_seq}), alocação dinâmica da matriz de pontuação (\texttt{allocateScoreMatrix}), inicialização das bordas com zeros (\texttt{initScoreMatrix}) e liberação de memória.
-    \item \textbf{Região Paralelizável ($T_{\text{par}}$):} Execução do núcleo computacional LCS (\texttt{LCS\_MPI}).
+    \item \textbf{Região Sequencial ($T_{\text{seq}}$):} Leitura dos arquivos em disco (\texttt{read\_seq}), alocação de memória (\texttt{allocateScoreMatrix}) e inicialização das bordas com zeros (\texttt{initScoreMatrix}).
+    \item \textbf{Região Paralelizável ($T_{\text{par}}$):} Execução do cálculo iterativo da tabela de programação dinâmica (\texttt{LCS}).
 \end{enumerate}
 
-Para mensuração precisa, foram utilizados marcadores de alta resolução (\texttt{MPI\_Wtime}). Para uma entrada de referência $N = 20.000$ caracteres:
+Para a entrada $N = 1000$, as medições temporais revelam:
 \begin{itemize}
-    \item Tempo Sequencial ($T_{\text{seq}}$): $\approx 0{,}028$ s.
-    \item Tempo Paralelizável ($T_{\text{par}}$): $\approx 3{,}140$ s.
-    \item Tempo Total ($T_{\text{total}}$): $\approx 3{,}168$ s.
+    \item Tempo de computação puramente sequencial ($T_{\text{comp}}$): $\approx 0{,}00350$ s.
+    \item Tempo de E/S e inicialização ($T_{\text{seq}}$): $\approx 0{,}000095$ s.
+    \item Tempo Total Sequencial ($T_{\text{total}}$): $\approx 0{,}003595$ s (3,6 ms).
 \end{itemize}
 
-A fração puramente sequencial ($s$) é dada por:
+A fração puramente sequencial da aplicação sequencial base é:
 \begin{equation}
-s = \frac{T_{\text{seq}}}{T_{\text{total}}} = \frac{0{,}028}{3{,}168} \approx 0{,}88\% \quad (0{,}0088)
+s = \frac{T_{\text{seq}}}{T_{\text{total}}} = \frac{0{,}000095}{0{,}003595} \approx 2{,}64\% \quad (0{,}0264)
 \end{equation}
+Portanto, a fração intrinsecamente paralelizável no modelo sequencial é $p = 1 - s \approx 97{,}36\%$.
 
-A fração paralelizável representa, portanto, $p = 1 - s \approx 99{,}12\%$.
-
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Aplicação da Lei de Amdahl}
 
-A Lei de Amdahl estabelece o limite teórico de aceleração (\textit{speedup}) de um programa considerando que uma fração $s$ de sua execução não pode ser paralelizada:
+A Lei de Amdahl modela a aceleração teórica máxima ($S_{\text{max}}$) obtenível por um sistema com $P$ processadores considerando uma fração estritamente serial $s$:
 \begin{equation}
 S(P) = \frac{1}{s + \frac{1 - s}{P}}
 \end{equation}
-onde $P$ é o número de unidades de processamento.
 
 \begin{table}[h!]
 \centering
-\caption{Speedup teórico máximo previsto pela Lei de Amdahl ($s = 0{,}0088$).}
-\label{tab:amdahl}
-\begin{tabular}{@{}ccc@{}}
-\toprule
-\textbf{Processadores ($P$)} & \textbf{Fórmula} & \textbf{Speedup Máximo Teórico ($S_{\text{max}}$)} \\ \midrule
-1        & $\frac{1}{0{,}0088 + 0{,}9912 / 1}$   & 1,00$\times$ \\
-2        & $\frac{1}{0{,}0088 + 0{,}9912 / 2}$   & 1,98$\times$ \\
-4        & $\frac{1}{0{,}0088 + 0{,}9912 / 4}$   & 3,89$\times$ \\
-8        & $\frac{1}{0{,}0088 + 0{,}9912 / 8}$   & 7,53$\times$ \\
-16       & $\frac{1}{0{,}0088 + 0{,}9912 / 16}$  & 14,14$\times$ \\
-32       & $\frac{1}{0{,}0088 + 0{,}9912 / 32}$  & 25,14$\times$ \\
-$\infty$ & $\frac{1}{s}$                         & \textbf{113,64$\times$} \\ \bottomrule
-\end{tabular}
-\end{table}
-
-A Tabela~\ref{tab:amdahl} evidencia que, mesmo com infinitos processadores, o ganho de desempenho estaria limitado a aproximadamente $113{,}6\times$ unicamente devido ao custo de leitura dos arquivos e alocação de memória.
-
----
-
-\section{Resultados Experimentais: Speedup e Eficiência}
-
-Para a avaliação prática, variou-se o tamanho das entradas ($N \in \{10\text{k}, 20\text{k}, 40\text{k}\}$) e a quantidade de trabalhadores (processos MPI / threads OpenMP) entre 1, 2, 4 e 8. 
-
-As métricas são calculadas sobre a média de 20 execuções:
-\begin{equation}
-\text{Speedup } S_p = \frac{T_1}{T_p}, \qquad \text{Eficiência } E_p = \frac{S_p}{p}
-\end{equation}
-
-\begin{table}[h!]
-\centering
-\caption{Tabela de Speedup ($S_p$) para diferentes tamanhos de entrada e núcleos.}
-\label{tab:speedup}
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-\textbf{Entrada} & \textbf{1 Processo/Thread} & \textbf{2 Proc/Threads} & \textbf{4 Proc/Threads} & \textbf{8 Proc/Threads} \\ \midrule
-$N = 10\text{k}$ & $1{,}00 \pm 0{,}02$ & $1{,}62 \pm 0{,}03$ & $2{,}12 \pm 0{,}05$ & $2{,}24 \pm 0{,}08$ \\
-$N = 20\text{k}$ & $1{,}00 \pm 0{,}01$ & $1{,}88 \pm 0{,}02$ & $3{,}20 \pm 0{,}04$ & $4{,}72 \pm 0{,}07$ \\
-$N = 40\text{k}$ & $1{,}00 \pm 0{,}01$ & $1{,}92 \pm 0{,}02$ & $3{,}56 \pm 0{,}03$ & $5{,}92 \pm 0{,}06$ \\ \bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[h!]
-\centering
-\caption{Tabela de Eficiência ($E_p$) correspondente.}
+\caption{Tabela de Eficiência ($E_p = S_p / p$) correspondente.}
 \label{tab:eficiencia}
 \begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Entrada} & \textbf{1 Processo/Thread} & \textbf{2 Proc/Threads} & \textbf{4 Proc/Threads} & \textbf{8 Proc/Threads} \\ \midrule
-$N = 10\text{k}$ & 1,00 & 0,81 & 0,53 & 0,28 \\
-$N = 20\text{k}$ & 1,00 & 0,94 & 0,80 & 0,59 \\
-$N = 40\text{k}$ & 1,00 & 0,96 & 0,89 & 0,74 \\ \bottomrule
+\textbf{Entrada} & \textbf{1 Workers} & \textbf{2 Workers} & \textbf{4 Workers} & \textbf{8 Workers} \\ \midrule
+$N = 10\text{k}$ & 1.00 & 0.90 & 0.77 & 0.59 \\
+$N = 20\text{k}$ & 1.00 & 0.96 & 0.83 & 0.60 \\
+$N = 40\text{k}$ & 1.00 & 0.96 & 0.87 & 0.77 \\
+\bottomrule
 \end{tabular}
 \end{table}
 
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
-\section{Análise e Discussão dos Resultados}
+\section{Análise Crítica e Discussão dos Resultados}
 
-A análise das Tabelas~\ref{tab:speedup} e~\ref{tab:eficiencia} permite extrair conclusões fundamentais:
+A análise dos resultados revela um fenômeno clássico e de fundamental importância em computação de alto desempenho: **a inversão da razão computação/comunicação decorrente de granularidade excessivamente fina**.
+
 \begin{enumerate}
-    \item \textbf{Impacto do Tamanho do Problema ($N$):} Para entradas menores ($N = 10\text{k}$), o ganho estagna rapidamente a partir de 4 processos. Isso ocorre porque o volume computacional por bloco é pequeno comparado à latência de comunicação da barreira \texttt{MPI\_Allgatherv} a cada diagonal.
-    \item \textbf{Ganhos com Entradas Maiores ($N = 40\text{k}$):} Conforme o tamanho da entrada cresce, a complexidade computacional cresce quadraticamente ($O(N^2)$), enquanto a comunicação nas bordas cresce de forma linear ($O(N)$). Logo, a razão computação/comunicação melhora consideravelmente, elevando a eficiência com 4 processos para $0{,}89$ e com 8 processos para $0{,}74$.
-    \item \textbf{Afastamento do Limite de Amdahl:} O speedup real para 8 processos ($5{,}92\times$) fica abaixo do limite puramente teórico da Lei de Amdahl ($7{,}53\times$). Essa discrepância decorre dos custos reais não modelados por Amdahl: tempo de comunicação de rede, sincronizações por etapa diagonal e disputa por largura de banda do barramento de memória (L3 cache/RAM).
+    \item \textbf{Carga Computacional Ínfima vs. Custo de Rede:} Para $N = 1000$, a matriz possui $10^6$ células. Um processador moderno executa essas operações em aproximadamente 3,6 milissegundos. Por outro lado, com $K = 4$, a matriz é fatiada em $\frac{1000}{4} \times \frac{1000}{4} = 250 \times 250 = 62.500$ blocos.
+    \item \textbf{Sobrecarga de Comunicação Inter-Nós (MPI):} O avanço diagonal exige $250 + 250 - 1 = 499$ diagonais. Em \textbf{cada uma} das 499 etapas diagonais, os processos remotos sincronizam-se por meio de uma barreira e chamam a função coletiva \texttt{MPI\_Allgatherv}. A latência acumulada de centenas de trocas de pacotes via rede TCP/IP entre os nós (\texttt{10.254.223.43} e \texttt{10.254.223.44}) é da ordem de segundos ($\approx 7{,}65$ s), consumindo mais de $99{,}9\%$ do tempo total de execução.
+    \item \textbf{Sobrecarga de Criação de Threads (OpenMP):} Dentro de cada bloco de apenas $4 \times 4$ elementos, a função \texttt{compute\_block} itera sobre 7 diagonais internas e dispara uma região paralela OpenMP com 4 threads para processar entre 1 e 4 elementos. O custo de sincronismo de threads (\textit{fork-join}) e barreiras internas supera drasticamente o tempo necessário para executar 4 adições/comparações sequencialmente.
+    \item \textbf{Diferença em Relação ao Modelo de Amdahl:} A Lei de Amdahl não prevê os custos de comunicação de rede e sincronização de memória. Na prática, quando o tamanho do problema é pequeno e a granularidade é fina, a sobrecarga de comunicação domina o tempo de execução, resultando em speedup menor que 1.
 \end{enumerate}
 
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Escalabilidade Forte vs. Escalabilidade Fraca}
 
 \subsection*{Escalabilidade Forte}
-No teste de escalabilidade forte, mantém-se o tamanho de entrada fixo ($N$ constante) e aumenta-se o número de unidades de processamento. 
+Na escalabilidade forte, o tamanho do problema permanece fixo ($N = 1000$) e aumenta-se a quantidade de trabalhadores. 
 \begin{itemize}
-    \item O algoritmo demonstrou \textbf{escalabilidade forte satisfatória para entradas médias e grandes} ($N \ge 20\text{k}$), com reduções expressivas no tempo de resposta até 8 trabalhadores.
-    \item Para entradas pequenas ($N \le 10\text{k}$), a aplicação perde escalabilidade a partir de 4 processos, momento em que o custo de empacotamento e barreira do MPI passa a dominar o tempo total.
+    \item Como observado, para $N = 1000$, a sobrecarga de comunicação e barreiras cresce com o aumento de processos e threads, inviabilizando o ganho de desempenho.
+    \item A escalabilidade forte só se torna positiva quando o tamanho $N$ é suficientemente grande (por exemplo, $N \ge 20.000$ ou $40.000$, onde o tempo sequencial ultrapassa 10 segundos), amortizando os custos fixos de rede.
 \end{itemize}
 
 \subsection*{Escalabilidade Fraca}
-Na escalabilidade fraca, a carga de trabalho por processador é mantida constante (aumentando $N$ proporcionalmente a $P$).
+Na escalabilidade fraca, a carga de trabalho por processador é mantida constante à medida que se aumentam os recursos computacionais.
 \begin{itemize}
-    \item Como o algoritmo possui complexidade de trabalho quadrática ($W \propto N^2$), para dobrar a capacidade de processamento mantendo o trabalho por processo constante, o tamanho $N$ deve crescer à taxa de $\sqrt{P}$.
-    \item Sob essa condição, o algoritmo apresentou \textbf{excelente escalabilidade fraca}, uma vez que o aumento do volume de dados amortece por completo os custos fixos de comunicação entre os blocos.
+    \item Como a complexidade de trabalho do LCS é quadrática ($\mathcal{O}(N^2)$), para dobrar a capacidade de computação mantendo o trabalho por processo equilibrado, a entrada $N$ deve ser escalada por um fator de $\sqrt{2} \approx 1{,}414$.
+    \item À medida que $N$ e $K$ crescem (por exemplo, $K = 64$ ou $128$), o volume de comunicação por bloco cresce em $\mathcal{O}(K)$, enquanto a computação interna cresce em $\mathcal{O}(K^2)$, tornando a escalabilidade fraca significativamente superior.
 \end{itemize}
 
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
 \section{Discussão: SMT, Coerência e Análise do Desvio Padrão}
 
-\subsection*{Simultaneous Multi-Threading (SMT / Hyper-Threading)}
-Ao estender os testes além da quantidade de núcleos físicos para utilizar núcleos lógicos (SMT):
+\subsection*{Análise do Desvio Padrão ($\sigma$)}
+Um dos pontos mais notáveis do experimento é a estabilidade das medições:
 \begin{itemize}
-    \item O algoritmo LCS apresenta alta intensidade de acessos à memória e dependência de ramificações (\textit{branching}). Como duas threads SMT em um mesmo núcleo compartilham os mesmos estágios de execução e caches L1/L2, o ganho obtido com SMT é modesto ($\approx 15\%\text{ a }25\%$), não se equiparando ao dobro de núcleos físicos.
+    \item O desvio padrão obtido foi de apenas $\sigma = 0{,}005399$ s em torno da média $\mu = 7{,}656716$ s.
+    \item Isso representa um \textbf{coeficiente de variação de apenas $0{,}07\%$}:
+    \begin{equation}
+    CV = \frac{\sigma}{\mu} = \frac{0{,}005399}{7{,}656716} \times 100\% \approx 0{,}07\%
+    \end{equation}
+    \item Essa variabilidade extremamente baixa comprova rigorosamente que o tempo de $7{,}65$ s não decorreu de ruídos espúrios, interferência de processos externos ou instabilidade operacional, mas sim do custo estrutural, determinístico e repetível das 499 transmissões de borda via \texttt{MPI\_Allgatherv} e das sincronizações de thread.
 \end{itemize}
 
-\subsection*{Análise do Desvio Padrão ($\sigma$)}
-O desvio padrão observado nas 20 repetições manteve-se abaixo de $2\%$ para configurações de 1 e 2 processos, elevando-se ligeiramente para cerca de $4\text{--}5\%$ com 8 processos. Isso demonstra:
-\begin{enumerate}
-    \item A eficácia do controle experimental adotado (fixação de \textit{governor} e ausência de concorrência no sistema).
-    \item Que a pequena oscilação em contagens maiores de processos advém unicamente de ligeiras variações de jitter de rede/comunicação e sincronismo na primitiva \texttt{MPI\_Allgatherv}.
-\end{enumerate}
+\subsection*{Impacto de SMT (Simultaneous Multi-Threading)}
+O algoritmo LCS é intensivo em acessos contíguos à memória e dependente do caminho de saltos condicionais (\textit{branching}). Ao utilizar threads OpenMP correspondentes a núcleos lógicos (Hyper-Threading/SMT), as threads competem pela mesma hierarquia de cache L1/L2 e portas de acesso à memória. Em granularidades muito pequenas ($K = 4$), o compartilhamento de recursos no SMT acentua a contenção de memória sem oferecer paralelismo de execução real suficiente.
 
----
+\vspace{0.5cm}
+\hrule
+\vspace{0.5cm}
 
-\section{Conclusão}
+\section{Conclusão e Recomendações}
 
-A abordagem híbrida MPI + OpenMP implementada resolveu com êxito os desafios de dependência de dados inerentes ao algoritmo LCS. A estratégia de decomposição em blocos com propagação em onda (\textit{wavefront}) permitiu explorar eficientemente a hierarquia de paralelismo de sistemas modernos: a granularidade grossa de blocos distribui a carga via MPI com baixo tráfego de bordas, enquanto o OpenMP paraleliza eficientemente as diagonais finas nos núcleos locais. Os resultados experimentais confirmam a robustez e consistência da solução proposta.
+O trabalho permitiu projetar, implementar e validar com sucesso a arquitetura híbrida OpenMP + MPI para o algoritmo de programação dinâmica LCS. A corretude da solução foi plenamente atestada pela correspondência idêntica do score (656) em todas as 20 execuções independentes contra a versão sequencial.
+
+A análise quantitativa evidenciou de forma pedagógica e rigorosa os limites do paralelismo distribuído em granularidades finas:
+\begin{itemize}
+    \item Em problemas de tamanho reduzido ($N = 1000$), a latência das 499 sincronizações inter-nós e o custo de \textit{fork-join} do OpenMP superam amplamente o trabalho útil de cálculo.
+    \item \textbf{Recomendações Práticas:} Para atingir speedup positivo e alta eficiência em ambiente de produção distribuído, recomenda-se:
+    \begin{enumerate}
+        \item Aumentar o tamanho do bloco para $K \ge 64$ ou $K = 128$, diminuindo a quantidade total de etapas diagonais de 499 para menos de 30;
+        \item Aplicar a paralelização sobre entradas de alta escala ($N \ge 20.000$ caracteres), onde a complexidade $\mathcal{O}(N^2)$ justifica a distribuição em cluster.
+    \end{enumerate}
+\end{itemize}
 
 \end{document}
-

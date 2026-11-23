@@ -15,61 +15,49 @@
 
 #define MPI_MTYPE_BYTES sizeof(mtype)
 
-#define K 4
+#ifndef DEFAULT_K
+#define DEFAULT_K 100
+#endif
 
 typedef unsigned short mtype;
 
 /* Read sequence from a file to a char vector.
- Filename is passed as parameter */
-
+   Filename is passed as parameter */
 char *read_seq(char *fname) {
-  // file pointer
   FILE *fseq = NULL;
-  // sequence size
   long size = 0;
-  // sequence pointer
   char *seq = NULL;
-  // sequence index
   int i = 0;
 
-  // open file
   fseq = fopen(fname, "rt");
   if (fseq == NULL) {
     printf("Error reading file %s\n", fname);
     exit(1);
   }
 
-  // find out sequence size to allocate memory afterwards
   fseek(fseq, 0L, SEEK_END);
   size = ftell(fseq);
   rewind(fseq);
 
-  // allocate memory (sequence)
   seq = (char *)calloc(size + 1, sizeof(char));
   if (seq == NULL) {
-    printf("Erro allocating memory for sequence %s.\n", fname);
+    printf("Error allocating memory for sequence %s.\n", fname);
     exit(1);
   }
 
-  // read sequence from file
   while (!feof(fseq)) {
     seq[i] = fgetc(fseq);
     if ((seq[i] != '\n') && (seq[i] != EOF))
       i++;
   }
-  // insert string terminator
   seq[i] = '\0';
 
-  // close file
   fclose(fseq);
-
-  // return sequence pointer
   return seq;
 }
 
 mtype **allocateScoreMatrix(int sizeA, int sizeB) {
   int i;
-  // Allocate memory for LCS score matrix
   mtype **scoreMatrix = (mtype **)malloc((sizeB + 1) * sizeof(mtype *));
   for (i = 0; i < (sizeB + 1); i++)
     scoreMatrix[i] = (mtype *)calloc(sizeA + 1, sizeof(mtype));
@@ -78,11 +66,9 @@ mtype **allocateScoreMatrix(int sizeA, int sizeB) {
 
 void initScoreMatrix(mtype **scoreMatrix, int sizeA, int sizeB) {
   int i, j;
-  // Fill first line of LCS score matrix with zeroes
   for (j = 0; j < (sizeA + 1); j++)
     scoreMatrix[0][j] = 0;
 
-  // Do the same for the first collumn
   for (i = 1; i < (sizeB + 1); i++)
     scoreMatrix[i][0] = 0;
 }
@@ -102,43 +88,28 @@ static inline void block_range(int bcount, int procNum, int rank, int *BStart,
   *BEnd = round_div(bcount * (rank + 1), procNum) - 1;
 }
 
-/* Calcula um bloco individual (K x K), percorrendo suas diagonais internas;
-   os elementos de cada diagonal interna do bloco são calculados em paralelo com
-   OpenMP */
-static void compute_block(mtype **scoreMatrix, char *seq_row, char *seq_col,
-                          int row_start, int row_end, int col_start,
-                          int col_end) {
-  int num_rows = row_end - row_start + 1; /* quantidade de linhas do bloco  */
-  int num_cols = col_end - col_start + 1; /* quantidade de colunas do bloco */
-  int total_internal_diags =
-      num_rows + num_cols - 1; /* total de diagonais internas   */
-
-  for (int diag_idx = 0; diag_idx < total_internal_diags; diag_idx++) {
-    int min_row_offset = max(0, diag_idx - num_cols + 1);
-    int max_row_offset = min(diag_idx, num_rows - 1);
-
-#pragma omp parallel for schedule(static)
-    for (int row_offset = min_row_offset; row_offset <= max_row_offset;
-         row_offset++) {
-      int row = row_start + row_offset;
-      int col = col_start + (diag_idx - row_offset);
-      if (seq_row[row - 1] == seq_col[col - 1])
-        scoreMatrix[row][col] = scoreMatrix[row - 1][col - 1] + 1;
+/* Computa um bloco individual (K x K) de forma sequencial e vetorizada.
+   A paralelização OpenMP atua sobre a distribuição dos múltiplos blocos
+   independentes de cada diagonal, maximizando localidade temporal/espacial. */
+static inline void compute_block(mtype **scoreMatrix, char *seq_row, char *seq_col,
+                                 int row_start, int row_end, int col_start,
+                                 int col_end) {
+  for (int r = row_start; r <= row_end; r++) {
+    char cr = seq_row[r - 1];
+    for (int c = col_start; c <= col_end; c++) {
+      if (cr == seq_col[c - 1])
+        scoreMatrix[r][c] = scoreMatrix[r - 1][c - 1] + 1;
       else
-        scoreMatrix[row][col] =
-            max(scoreMatrix[row - 1][col], scoreMatrix[row][col - 1]);
+        scoreMatrix[r][c] = max(scoreMatrix[r - 1][c], scoreMatrix[r][c - 1]);
     }
   }
 }
 
 int LCS_MPI(mtype **scoreMatrix, int m, int n, int k, int procNum, int procRank,
             char *A, char *B) {
-  /* Algoritmo 1: linhas 6 a 8 (com teto, para tratar tamanhos não múltiplos de
-   * k) */
-  // int BRow = (m + k - 1) / k;
-  // int BCol = (n + k - 1) / k;
-  int BRows = m / k;
-  int BCols = n / k;
+  /* Divisão com teto para garantir que todas as linhas e colunas sejam cobertas */
+  int BRows = (m + k - 1) / k;
+  int BCols = (n + k - 1) / k;
   int BDiags = BRows + BCols - 1;
 
   int maxBlocks = min(BRows, BCols);
@@ -147,13 +118,12 @@ int LCS_MPI(mtype **scoreMatrix, int m, int n, int k, int procNum, int procRank,
   int *displacements = malloc(procNum * sizeof(int));
 
   for (int i = 0; i < BDiags; i++) {
-    /* Blocos (block_row, block_col) com block_row + block_col = diag_idx */
+    /* Blocos (block_row, block_col) com block_row + block_col = i */
     int min_block_row = max(0, i - BCols + 1);
     int max_block_row = min(i, BRows - 1);
     int blocks_in_diag = max_block_row - min_block_row + 1;
 
-    /* Calcula a fatia de blocos de cada rank e os parâmetros para o
-     * MPI_Allgatherv */
+    /* Calcula a fatia de blocos de cada rank e os parâmetros para o MPI_Allgatherv */
     for (int r = 0; r < procNum; r++) {
       int r_start, r_end;
       block_range(blocks_in_diag, procNum, r, &r_start, &r_end);
@@ -165,8 +135,8 @@ int LCS_MPI(mtype **scoreMatrix, int m, int n, int k, int procNum, int procRank,
     int BStart, BEnd;
     block_range(blocks_in_diag, procNum, procRank, &BStart, &BEnd);
 
-    /* Cada processo calcula sequencialmente os blocos que lhe foram atribuídos
-     */
+    /* Paralelização OpenMP sobre os blocos independentes atribuídos a este rank */
+    #pragma omp parallel for schedule(dynamic)
     for (int t = BStart; t <= BEnd; t++) {
       int block_row = min_block_row + t;
       int block_col = i - block_row;
@@ -177,8 +147,7 @@ int LCS_MPI(mtype **scoreMatrix, int m, int n, int k, int procNum, int procRank,
 
       compute_block(scoreMatrix, A, B, row_start, row_end, col_start, col_end);
 
-      /* Empacota a última linha e a última coluna do bloco no buffer de bordas
-       */
+      /* Empacota a última linha e a última coluna do bloco no buffer de bordas */
       mtype *border_ptr = borderBuf + (size_t)t * 2 * k;
       for (int col = col_start; col <= col_end; col++)
         border_ptr[col - col_start] = scoreMatrix[row_end][col];
@@ -186,29 +155,29 @@ int LCS_MPI(mtype **scoreMatrix, int m, int n, int k, int procNum, int procRank,
         border_ptr[k + row - row_start] = scoreMatrix[row][col_end];
     }
 
-    /* Comunicação coletiva: todos os processos trocam as bordas calculadas
-     * nesta diagonal */
-    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, borderBuf, recv_counts,
-                   displacements, MPI_BYTE, MPI_COMM_WORLD);
+    /* Comunicação coletiva: sincroniza e troca bordas se houver mais de 1 rank */
+    if (procNum > 1) {
+      MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, borderBuf, recv_counts,
+                     displacements, MPI_BYTE, MPI_COMM_WORLD);
 
-    /* Desempacota as bordas dos blocos que foram calculados pelos outros
-     * processos */
-    for (int t = 0; t < blocks_in_diag; t++) {
-      if (t >= BStart && t <= BEnd)
-        continue;
+      /* Desempacota as bordas dos blocos calculados pelos outros processos */
+      for (int t = 0; t < blocks_in_diag; t++) {
+        if (t >= BStart && t <= BEnd)
+          continue;
 
-      int block_row = min_block_row + t;
-      int block_col = i - block_row;
-      int row_start = block_row * k + 1;
-      int row_end = min((block_row + 1) * k, m);
-      int col_start = block_col * k + 1;
-      int col_end = min((block_col + 1) * k, n);
+        int block_row = min_block_row + t;
+        int block_col = i - block_row;
+        int row_start = block_row * k + 1;
+        int row_end = min((block_row + 1) * k, m);
+        int col_start = block_col * k + 1;
+        int col_end = min((block_col + 1) * k, n);
 
-      mtype *border_ptr = borderBuf + (size_t)t * 2 * k;
-      for (int col = col_start; col <= col_end; col++)
-        scoreMatrix[row_end][col] = border_ptr[col - col_start];
-      for (int row = row_start; row <= row_end; row++)
-        scoreMatrix[row][col_end] = border_ptr[k + row - row_start];
+        mtype *border_ptr = borderBuf + (size_t)t * 2 * k;
+        for (int col = col_start; col <= col_end; col++)
+          scoreMatrix[row_end][col] = border_ptr[col - col_start];
+        for (int row = row_start; row <= row_end; row++)
+          scoreMatrix[row][col_end] = border_ptr[k + row - row_start];
+      }
     }
   }
 
@@ -223,14 +192,9 @@ int LCS_MPI(mtype **scoreMatrix, int m, int n, int k, int procNum, int procRank,
 void printMatrix(char *seqA, char *seqB, mtype **scoreMatrix, int sizeA,
                  int sizeB) {
   int i, j;
-
-  // print header
   printf("[DEBUG] start matrix\n");
-
-  // print LCS score matrix allong with sequences
   printf("[DEBUG]    ");
   printf("%2c    ", ' ');
-
   for (j = 0; j < sizeA; j++)
     printf("%2c   ", seqA[j]);
   printf("\n");
@@ -244,7 +208,6 @@ void printMatrix(char *seqA, char *seqB, mtype **scoreMatrix, int sizeA,
     }
     printf("\n");
   }
-
   printf("[DEBUG] end matrix\n");
 }
 
@@ -256,60 +219,62 @@ void freeScoreMatrix(mtype **scoreMatrix, int sizeB) {
 }
 
 int main(int argc, char **argv) {
-  // sequence pointers for both sequences
   char *seqA, *seqB;
-
-  // sizes of both sequences and MPI process info
   int sizeA, sizeB, proc_rank, num_procs;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &proc_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-  // read both sequences
   seqA = read_seq("fileA.in");
   seqB = read_seq("fileB.in");
 
-  // find out sizes
   sizeA = strlen(seqA);
   sizeB = strlen(seqB);
 
-  // allocate LCS score matrix
-  mtype **scoreMatrix = allocateScoreMatrix(sizeA, sizeB);
+  /* Configuração do tamanho de bloco K:
+     Prioridade: 1) argv[1], 2) env LCS_BLOCK_SIZE, 3) heurística por tamanho de N */
+  int block_k = DEFAULT_K;
+  char *env_k = getenv("LCS_BLOCK_SIZE");
+  if (argc > 1 && atoi(argv[1]) > 0) {
+    block_k = atoi(argv[1]);
+  } else if (env_k != NULL && atoi(env_k) > 0) {
+    block_k = atoi(env_k);
+  } else {
+    if (sizeA >= 20000) block_k = 200;
+    else if (sizeA >= 10000) block_k = 100;
+    else if (sizeA >= 2000) block_k = 50;
+    else if (sizeA >= 500) block_k = 25;
+    else block_k = 4;
+  }
 
-  // initialize LCS score matrix
+  mtype **scoreMatrix = allocateScoreMatrix(sizeA, sizeB);
   initScoreMatrix(scoreMatrix, sizeA, sizeB);
 
-  // Synchronize all processes before measuring execution time
   MPI_Barrier(MPI_COMM_WORLD);
   double start_time = MPI_Wtime();
 
-  // fill up the rest of the matrix and return final score (element located at
-  // the last line and column)
   mtype score =
-      LCS_MPI(scoreMatrix, sizeB, sizeA, K, num_procs, proc_rank, seqB, seqA);
+      LCS_MPI(scoreMatrix, sizeB, sizeA, block_k, num_procs, proc_rank, seqB, seqA);
 
   MPI_Barrier(MPI_COMM_WORLD);
   double end_time = MPI_Wtime();
   double elapsed_time = end_time - start_time;
 
-/* if you wish to see the entire score matrix,
- for debug purposes, define DEBUG. */
 #ifdef DEBUG
   if (proc_rank == 0)
     printMatrix(seqA, seqB, scoreMatrix, sizeA, sizeB);
 #endif
 
-  // print score and measured execution time (only rank 0)
   if (proc_rank == 0) {
     printf("Score: %d\n", score);
     printf("Time: %.6f\n", elapsed_time);
   }
 
-  // free score matrix
   freeScoreMatrix(scoreMatrix, sizeB);
+  free(seqA);
+  free(seqB);
 
   MPI_Finalize();
-
   return EXIT_SUCCESS;
 }
